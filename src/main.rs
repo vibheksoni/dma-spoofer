@@ -7,7 +7,7 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 
-use crate::core::{Dma, DsePatcher, PatchGuardBypass};
+use crate::core::{DeviceType, Dma, DsePatcher, PatchGuardBypass, VmwareInfo};
 use crate::hwid::{SeedConfig, SerialGenerator};
 use crate::spoofers::arp::ArpSpoofer;
 use crate::spoofers::boot::BootSpoofer;
@@ -39,9 +39,11 @@ fn main() -> Result<()> {
     clear_screen();
     print_banner();
 
-    println!("{}[*] Initializing DMA...{}", GRAY, RESET);
-    let dma = Dma::new()?;
-    print_fpga_info(&dma);
+    let dma = select_device()?;
+    match dma.device_type() {
+        DeviceType::Fpga => print_fpga_info(&dma),
+        DeviceType::Vmware => print_vmware_info(&dma),
+    }
 
     loop {
         print_main_menu();
@@ -865,6 +867,89 @@ fn print_fpga_info(dma: &Dma) {
             WHITE, info.id, info.version_major, info.version_minor, RESET
         );
     }
+}
+
+fn print_vmware_info(dma: &Dma) {
+    if let Some(info) = dma.get_vmware_info() {
+        println!(
+            "{}[+] VMware VM Connected (Memory: {} MB){}",
+            WHITE, info.memory_size_mb, RESET
+        );
+    } else {
+        println!("{}[+] VMware VM Connected{}", WHITE, RESET);
+    }
+}
+
+fn select_device() -> Result<Dma<'static>> {
+    println!();
+    println!("{}┌──────────────────────────────────────┐{}", RED, RESET);
+    println!(
+        "{}│{}         SELECT DEVICE TYPE           {}│{}",
+        RED, WHITE, RED, RESET
+    );
+    println!("{}├──────────────────────────────────────┤{}", RED, RESET);
+    println!(
+        "{}│{}  1. FPGA (DMA Hardware)             {}│{}",
+        RED, WHITE, RED, RESET
+    );
+    println!(
+        "{}│{}  2. VMware VM                      {}│{}",
+        RED, WHITE, RED, RESET
+    );
+    println!("{}└──────────────────────────────────────┘{}", RED, RESET);
+    print!("\n{}Select option:{} ", GRAY, RESET);
+    io::stdout().flush().unwrap();
+
+    let choice = read_input();
+
+    match choice.trim() {
+        "1" => {
+            println!("\n{}[*] Initializing FPGA DMA...{}", GRAY, RESET);
+            Dma::new()
+        }
+        "2" => {
+            println!("\n{}[*] Initializing VMware DMA...{}", GRAY, RESET);
+            println!("{}[*] Scanning for running VMs...{}", GRAY, RESET);
+
+            let vm_pid = detect_vmware_vms();
+            match vm_pid {
+                Some(pid) => {
+                    println!("{}[+] Found VM with PID: {}{}", WHITE, pid, RESET);
+                    Dma::new_vmware_with_pid(Some(pid))
+                }
+                None => {
+                    println!("{}[*] No specific VM detected, using auto-detect...{}", GRAY, RESET);
+                    Dma::new_vmware()
+                }
+            }
+        }
+        _ => {
+            println!("\n{}[*] Defaulting to FPGA...{}", GRAY, RESET);
+            Dma::new()
+        }
+    }
+}
+
+fn detect_vmware_vms() -> Option<u32> {
+    use std::process::Command;
+
+    let output = Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq vmware-vmx.exe", "/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines().skip(1) {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 2 {
+            if let Ok(pid) = parts[1].trim().parse::<u32>() {
+                return Some(pid);
+            }
+        }
+    }
+
+    None
 }
 
 fn list_gpu_uuids(dma: &Dma) -> Result<()> {

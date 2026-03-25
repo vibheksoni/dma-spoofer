@@ -1,6 +1,19 @@
 use anyhow::Result;
 use memprocfs::{LeechCore, Vmm, FLAG_NOCACHE};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceType {
+    Fpga,
+    Vmware,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Connected,
+    Disconnected,
+    Stale,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModuleInfo {
     pub base: u64,
@@ -21,21 +34,117 @@ pub struct FpgaInfo {
     pub version_minor: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct VmwareInfo {
+    pub vm_pid: u32,
+    pub vm_name: String,
+    pub memory_size_mb: u64,
+}
+
 pub struct Dma<'a> {
     vmm: Vmm<'a>,
+    device_type: DeviceType,
+    vmware_pid: Option<u32>,
 }
 
 impl<'a> Dma<'a> {
     pub fn new() -> Result<Self> {
         println!("    Loading vmm.dll...");
 
-        let args = vec!["-device", "fpga", "-waitinitialize"];
+        let args: Vec<&str> = vec!["-device", "fpga", "-waitinitialize"];
 
         println!("    Connecting to FPGA...");
         let vmm = Vmm::new("vmm.dll", &args)
             .map_err(|e| anyhow::anyhow!("VMMDLL_Initialize failed: {}", e))?;
 
-        Ok(Self { vmm })
+        Ok(Self {
+            vmm,
+            device_type: DeviceType::Fpga,
+            vmware_pid: None,
+        })
+    }
+
+    pub fn new_vmware() -> Result<Self> {
+        Self::new_vmware_with_pid(None)
+    }
+
+    pub fn new_vmware_with_pid(pid: Option<u32>) -> Result<Self> {
+        println!("    Loading vmm.dll...");
+
+        let args: Vec<String> = match pid {
+            Some(p) => {
+                println!("    Connecting to VMware VM (PID {})...", p);
+                vec!["-device".to_string(), format!("vmware://id={}", p)]
+            }
+            None => {
+                println!("    Connecting to VMware VM (auto-detect)...");
+                vec!["-device".to_string(), "vmware".to_string()]
+            }
+        };
+
+        let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        let vmm = Vmm::new("vmm.dll", &args_str)
+            .map_err(|e| anyhow::anyhow!("VMMDLL_Initialize failed: {}", e))?;
+
+        let max_addr = vmm
+            .get_config(memprocfs::CONFIG_OPT_CORE_MAX_NATIVE_ADDRESS)
+            .unwrap_or(0);
+        let memory_size_mb = max_addr / (1024 * 1024);
+
+        println!("    Connected! Memory size: {} MB", memory_size_mb);
+
+        Ok(Self {
+            vmm,
+            device_type: DeviceType::Vmware,
+            vmware_pid: pid,
+        })
+    }
+
+    pub fn device_type(&self) -> DeviceType {
+        self.device_type
+    }
+
+    pub fn is_vmware(&self) -> bool {
+        self.device_type == DeviceType::Vmware
+    }
+
+    pub fn reconnect(&mut self) -> Result<()> {
+        match self.device_type {
+            DeviceType::Fpga => {
+                let args: Vec<&str> = vec!["-device", "fpga", "-waitinitialize"];
+                self.vmm = Vmm::new("vmm.dll", &args)
+                    .map_err(|e| anyhow::anyhow!("Reconnect failed: {}", e))?;
+            }
+            DeviceType::Vmware => {
+                let args: Vec<String> = match self.vmware_pid {
+                    Some(p) => vec!["-device".to_string(), format!("vmware://id={}", p)],
+                    None => vec!["-device".to_string(), "vmware".to_string()],
+                };
+                let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                self.vmm = Vmm::new("vmm.dll", &args_str)
+                    .map_err(|e| anyhow::anyhow!("Reconnect failed: {}", e))?;
+            }
+        }
+        println!("    Reconnected successfully!");
+        Ok(())
+    }
+
+    pub fn get_vmware_info(&self) -> Option<VmwareInfo> {
+        if self.device_type != DeviceType::Vmware {
+            return None;
+        }
+
+        let max_addr = self
+            .vmm
+            .get_config(memprocfs::CONFIG_OPT_CORE_MAX_NATIVE_ADDRESS)
+            .unwrap_or(0);
+
+        Some(VmwareInfo {
+            vm_pid: self.vmware_pid.unwrap_or(0),
+            vm_name: "VMware VM".to_string(),
+            memory_size_mb: max_addr / (1024 * 1024),
+        })
     }
 
     pub fn vmm(&self) -> &Vmm<'a> {
@@ -170,5 +279,39 @@ impl<'a> Dma<'a> {
 
     pub fn read_u64_k(&self, addr: u64) -> Result<u64> {
         self.read_u64(4, addr)
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.read_phys(0x1000, 4).is_ok()
+    }
+
+    pub fn is_memory_volatile(&self) -> bool {
+        if let Ok(lc) = self.vmm.get_leechcore() {
+            lc.get_option(LeechCore::LC_OPT_CORE_VOLATILE)
+                .unwrap_or(0)
+                == 1
+        } else {
+            false
+        }
+    }
+
+    pub fn health_check(&self) -> ConnectionStatus {
+        if !self.is_connected() {
+            return ConnectionStatus::Disconnected;
+        }
+        if self.device_type == DeviceType::Vmware && !self.is_memory_volatile() {
+            return ConnectionStatus::Stale;
+        }
+        ConnectionStatus::Connected
+    }
+
+    pub fn ensure_connected(&mut self) -> Result<()> {
+        match self.health_check() {
+            ConnectionStatus::Connected => Ok(()),
+            ConnectionStatus::Disconnected | ConnectionStatus::Stale => {
+                println!("    [!] Connection lost, attempting reconnect...");
+                self.reconnect()
+            }
+        }
     }
 }

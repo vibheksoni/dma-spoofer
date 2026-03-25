@@ -2,14 +2,15 @@ use anyhow::{anyhow, Result};
 
 use crate::core::Dma;
 
-const USBSTOR_SIGNATURE: u32 = 0x21505355;
+const USBSTOR_FDO_SIGNATURE: u32 = 0x214F4446;
+const USBSTOR_PDO_SIGNATURE: u32 = 0x214F4450;
 
 const EXT_SIGNATURE: u64 = 0x00;
-const EXT_SELF_DEVICE: u64 = 0x08;
 const EXT_SERIAL_LENGTH: u64 = 0x40;
 const EXT_SERIAL_STRING: u64 = 0x6C;
 
-const DEVICE_OBJECT_NEXT_DEVICE: u64 = 0x18;
+const DRIVER_OBJECT_DEVICE_OBJECT: u64 = 0x08;
+const DEVICE_OBJECT_NEXT_DEVICE: u64 = 0x10;
 const DEVICE_OBJECT_DEVICE_EXTENSION: u64 = 0x40;
 
 #[derive(Debug, Clone)]
@@ -78,7 +79,9 @@ impl<'a> UsbSpoofer<'a> {
     pub fn enumerate(&mut self) -> Result<&Vec<UsbDevice>> {
         self.devices.clear();
 
-        let first_device = self.dma.read_u64(4, self.usbstor_driver + 0x08)?;
+        let first_device = self
+            .dma
+            .read_u64(4, self.usbstor_driver + DRIVER_OBJECT_DEVICE_OBJECT)?;
 
         if first_device == 0 {
             println!("[*] No USB storage devices attached");
@@ -110,7 +113,10 @@ impl<'a> UsbSpoofer<'a> {
         }
 
         let signature = self.dma.read_u32(4, extension + EXT_SIGNATURE)?;
-        if signature != USBSTOR_SIGNATURE {
+        if signature == USBSTOR_FDO_SIGNATURE {
+            return Err(anyhow!("FDO extension, skipping"));
+        }
+        if signature != USBSTOR_PDO_SIGNATURE {
             return Err(anyhow!("Invalid signature: 0x{:X}", signature));
         }
 

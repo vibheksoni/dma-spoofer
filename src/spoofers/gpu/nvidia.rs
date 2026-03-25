@@ -60,16 +60,16 @@ impl<'a> NvidiaSpoofer<'a> {
     }
 
     pub fn enumerate(&self) -> Result<Vec<GpuDevice>> {
-        if let Ok(devices) = self.enumerate_from_device_list() {
+        if let Ok(devices) = self.enumerate_from_gpu_manager_array() {
             if !devices.is_empty() {
-                println!("[+] Found {} GPU(s) via device list", devices.len());
+                println!("[+] Found {} GPU(s) via GPU manager array", devices.len());
                 return Ok(devices);
             }
         }
 
-        if let Ok(devices) = self.enumerate_from_gpu_manager_array() {
+        if let Ok(devices) = self.enumerate_from_device_list() {
             if !devices.is_empty() {
-                println!("[+] Found {} GPU(s) via GPU manager array", devices.len());
+                println!("[+] Found {} GPU(s) via device list", devices.len());
                 return Ok(devices);
             }
         }
@@ -521,31 +521,49 @@ impl<'a> NvidiaSpoofer<'a> {
     fn find_gpu_manager_array(&self) -> Result<u64> {
         println!("[*] Scanning for GPU manager array...");
 
-        let pattern: &[u8] = &[0x33, 0xC9, 0x4C, 0x8D, 0x05];
-
         let scan_size = 0x800000;
         let data = self.dma.read(4, self.driver_base, scan_size)?;
 
-        for i in 0..data.len().saturating_sub(pattern.len() + 11) {
-            if &data[i..i + pattern.len()] != pattern {
-                continue;
-            }
-
-            if data[i + 9] != 0x0F || data[i + 10] != 0x1F || data[i + 11] != 0x00 {
-                continue;
-            }
-
-            if data[i + 12] != 0x49
-                || data[i + 13] != 0x8B
-                || data[i + 14] != 0x1C
-                || data[i + 15] != 0xC8
+        for i in 0..data.len().saturating_sub(11) {
+            let (disp_offset, rip_offset_add) = if i + 16 <= data.len()
+                && data[i] == 0x33
+                && data[i + 1] == 0xC9
+                && data[i + 2] == 0x4C
+                && data[i + 3] == 0x8D
+                && data[i + 4] == 0x05
+                && data[i + 9] == 0x0F
+                && data[i + 10] == 0x1F
+                && data[i + 11] == 0x00
+                && data[i + 12] == 0x49
+                && data[i + 13] == 0x8B
+                && data[i + 14] == 0x1C
+                && data[i + 15] == 0xC8
             {
+                (5usize, 9u64)
+            } else if data[i] == 0x4C
+                && data[i + 1] == 0x8D
+                && data[i + 2] == 0x05
+                && data[i + 7] == 0x49
+                && data[i + 8] == 0x8B
+                && data[i + 9] == 0x1C
+                && data[i + 10] == 0xC8
+            {
+                (3usize, 7u64)
+            } else {
+                continue;
+            };
+
+            let rip_offset = i32::from_le_bytes(
+                data[i + disp_offset..i + disp_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let rip = self.driver_base + i as u64 + rip_offset_add;
+            let array_addr = (rip as i64 + rip_offset as i64) as u64;
+
+            if array_addr < self.driver_base || array_addr >= self.driver_base + self.driver_size {
                 continue;
             }
-
-            let rip_offset = i32::from_le_bytes(data[i + 5..i + 9].try_into().unwrap());
-            let rip = self.driver_base + i as u64 + 9;
-            let array_addr = (rip as i64 + rip_offset as i64) as u64;
 
             println!(
                 "[+] Found GPU manager array @ 0x{:X} (pattern at offset 0x{:X})",

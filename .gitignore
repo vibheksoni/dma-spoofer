@@ -61,6 +61,8 @@ Others/
 nul
 null
 ignore/
+dbuild.bat
+dbuild.py
 .*/
 *.md
 !README.md

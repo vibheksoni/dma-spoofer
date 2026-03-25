@@ -8,7 +8,7 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 
-use crate::cli::{CliArgs, CliCommand, run_cli, parse_args};
+use crate::cli::{parse_args, run_cli, CliArgs, CliCommand};
 use crate::core::{DeviceType, Dma, DsePatcher, PatchGuardBypass, VmwareInfo};
 use crate::hwid::{SeedConfig, SerialGenerator};
 use crate::spoofers::arp::ArpSpoofer;
@@ -927,7 +927,10 @@ fn select_device() -> Result<Dma<'static>> {
                     Dma::new_vmware_with_pid(Some(pid))
                 }
                 None => {
-                    println!("{}[*] No specific VM detected, using auto-detect...{}", GRAY, RESET);
+                    println!(
+                        "{}[*] No specific VM detected, using auto-detect...{}",
+                        GRAY, RESET
+                    );
                     Dma::new_vmware()
                 }
             }

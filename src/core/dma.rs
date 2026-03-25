@@ -287,9 +287,7 @@ impl<'a> Dma<'a> {
 
     pub fn is_memory_volatile(&self) -> bool {
         if let Ok(lc) = self.vmm.get_leechcore() {
-            lc.get_option(LeechCore::LC_OPT_CORE_VOLATILE)
-                .unwrap_or(0)
-                == 1
+            lc.get_option(LeechCore::LC_OPT_CORE_VOLATILE).unwrap_or(0) == 1
         } else {
             false
         }

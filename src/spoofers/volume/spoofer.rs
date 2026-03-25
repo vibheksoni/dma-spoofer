@@ -1,56 +1,52 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use crate::core::Dma;
 use crate::hwid::{SeedConfig, SerialGenerator};
 
 use super::offsets::*;
+use super::resolver::{resolve_volume_context, ResolvedVolumeContext};
 use super::types::{MountedDevice, VolumeGuid};
 
 const KERNEL_PID: u32 = 4;
+const MIN_KERNEL_POINTER: u64 = 0xFFFF000000000000;
 
 pub struct VolumeSpoofer<'a> {
     dma: &'a Dma<'a>,
-    mountmgr_base: u64,
     device_extension: u64,
+    resolved: ResolvedVolumeContext,
     mounted_devices: Vec<MountedDevice>,
 }
 
 impl<'a> VolumeSpoofer<'a> {
     pub fn new(dma: &'a Dma<'a>) -> Result<Self> {
         let module = dma.get_module(KERNEL_PID, "mountmgr.sys")?;
+        let resolved = resolve_volume_context(dma)?;
+
         println!(
             "[+] mountmgr.sys @ 0x{:X} (size: 0x{:X})",
             module.base, module.size
         );
-
-        let gdevice_object_ptr = module.base + MOUNTMGR_GDEVICE_OBJECT;
-        let device_object = dma.read_u64(KERNEL_PID, gdevice_object_ptr)?;
-
-        if device_object == 0 || device_object < 0xFFFF000000000000 {
-            return Err(anyhow::anyhow!(
-                "Invalid gDeviceObject: 0x{:X}",
-                device_object
-            ));
+        if resolved.build_number > 0 {
+            println!("[+] Volume layout build: {}", resolved.build_number);
         }
-        println!("[+] gDeviceObject @ 0x{:X}", device_object);
+        println!("[+] mountmgr DeviceObject @ 0x{:X}", resolved.device_object);
 
-        let device_extension =
-            dma.read_u64(KERNEL_PID, device_object + DEVICE_OBJECT_DEVICE_EXTENSION)?;
-        if device_extension == 0 || device_extension < 0xFFFF000000000000 {
-            return Err(anyhow::anyhow!(
-                "Invalid DeviceExtension: 0x{:X}",
-                device_extension
-            ));
+        let device_extension = dma.read_u64(
+            KERNEL_PID,
+            resolved.device_object + DEVICE_OBJECT_DEVICE_EXTENSION,
+        )?;
+        if !is_kernel_pointer(device_extension) {
+            return Err(anyhow!("Invalid DeviceExtension: 0x{:X}", device_extension));
         }
         println!("[+] DeviceExtension @ 0x{:X}", device_extension);
 
         let mut spoofer = Self {
             dma,
-            mountmgr_base: module.base,
             device_extension,
+            resolved,
             mounted_devices: Vec::new(),
         };
 
@@ -62,7 +58,7 @@ impl<'a> VolumeSpoofer<'a> {
     fn enumerate(&mut self) -> Result<()> {
         self.mounted_devices.clear();
 
-        let list_head = self.device_extension + EXTENSION_MOUNTED_DEVICES_LIST;
+        let list_head = self.device_extension + self.resolved.layout.extension_mounted_devices_list;
         let first_entry = self
             .dma
             .read_u64(KERNEL_PID, list_head + LIST_ENTRY_FLINK)?;
@@ -103,115 +99,100 @@ impl<'a> VolumeSpoofer<'a> {
     }
 
     fn read_mounted_device(&self, entry_addr: u64) -> Result<MountedDevice> {
-        let device_name_addr = entry_addr + MOUNTED_DEVICE_DEVICE_NAME;
-        let device_name = self.read_unicode_string(device_name_addr)?;
+        let device_name_addr = entry_addr + self.resolved.layout.mounted_device_device_name;
+        let mut device_name = self.read_unicode_string(device_name_addr)?;
+        if device_name.is_empty() && self.resolved.layout.mounted_device_device_name != 0x50 {
+            device_name = self.read_unicode_string(entry_addr + 0x50)?;
+        }
 
-        let unique_id_ptr = self
-            .dma
-            .read_u64(KERNEL_PID, entry_addr + MOUNTED_DEVICE_UNIQUE_ID)?;
-        let unique_id = if unique_id_ptr != 0 && unique_id_ptr > 0xFFFF000000000000 {
-            let id_len = self.dma.read_u16(KERNEL_PID, unique_id_ptr)?;
-            if id_len > 0 && id_len < 256 {
-                let id_buf_ptr = self.dma.read_u64(KERNEL_PID, unique_id_ptr + 8)?;
-                if id_buf_ptr != 0 {
-                    self.dma
-                        .read(KERNEL_PID, id_buf_ptr, id_len as usize)
-                        .unwrap_or_default()
+        let unique_id =
+            if let Some(unique_id_offset) = self.resolved.layout.mounted_device_unique_id {
+                let unique_id_ptr = self
+                    .dma
+                    .read_u64(KERNEL_PID, entry_addr + unique_id_offset)?;
+
+                if is_kernel_pointer(unique_id_ptr) {
+                    let id_len = self.dma.read_u16(KERNEL_PID, unique_id_ptr)?;
+                    if id_len > 0 && id_len < 256 {
+                        let id_buf_ptr = self.dma.read_u64(KERNEL_PID, unique_id_ptr + 8)?;
+                        if id_buf_ptr != 0 {
+                            self.dma
+                                .read(KERNEL_PID, id_buf_ptr, id_len as usize)
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
                 } else {
                     Vec::new()
                 }
             } else {
                 Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+            };
 
         Ok(MountedDevice::new(entry_addr, device_name, unique_id))
     }
 
     fn enumerate_symbolic_links(&self, device: &mut MountedDevice) -> Result<()> {
-        let list_head = device.entry_addr + MOUNTED_DEVICE_SYMBOLIC_LINKS;
-        let first_entry = self
-            .dma
-            .read_u64(KERNEL_PID, list_head + LIST_ENTRY_FLINK)?;
-
-        if first_entry == 0 || first_entry == list_head {
-            return Ok(());
+        let mut candidate_offsets = vec![self.resolved.layout.mounted_device_symbolic_links];
+        if !candidate_offsets.contains(&0x30) {
+            candidate_offsets.push(0x30);
         }
 
-        let mut current = first_entry;
-        let mut count = 0;
-        let max_entries = 64;
+        let mut seen_entries = Vec::new();
 
-        while current != list_head && count < max_entries {
-            if current == 0 || current < 0xFFFF000000000000 {
-                break;
+        for list_offset in candidate_offsets {
+            let list_head = device.entry_addr + list_offset;
+            let first_entry = self
+                .dma
+                .read_u64(KERNEL_PID, list_head + LIST_ENTRY_FLINK)?;
+
+            if first_entry == 0 || first_entry == list_head {
+                continue;
             }
 
-            match self.read_symbolic_link(current) {
-                Ok(Some(guid)) => {
-                    device.add_volume_guid(guid);
+            let mut current = first_entry;
+            let mut count = 0;
+            let max_entries = 64;
+
+            while current != list_head && count < max_entries {
+                if current == 0 || current < MIN_KERNEL_POINTER {
+                    break;
                 }
-                Ok(None) => {}
-                Err(_) => {}
-            }
 
-            let next = self.dma.read_u64(KERNEL_PID, current + LIST_ENTRY_FLINK)?;
-            if next == current {
-                break;
+                if seen_entries.contains(&current) {
+                    break;
+                }
+                seen_entries.push(current);
+
+                match self.read_symbolic_link(current) {
+                    Ok(Some(guid)) => {
+                        device.add_volume_guid(guid);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+
+                let next = self.dma.read_u64(KERNEL_PID, current + LIST_ENTRY_FLINK)?;
+                if next == current {
+                    break;
+                }
+                current = next;
+                count += 1;
             }
-            current = next;
-            count += 1;
         }
 
         Ok(())
     }
 
     fn read_symbolic_link(&self, entry_addr: u64) -> Result<Option<VolumeGuid>> {
-        let is_active = self
-            .dma
-            .read_u8(KERNEL_PID, entry_addr + SYMBOLIC_LINK_IS_ACTIVE)?;
-
-        let name_addr = entry_addr + SYMBOLIC_LINK_NAME;
-        let name_len = self
-            .dma
-            .read_u16(KERNEL_PID, name_addr + UNICODE_STRING_LENGTH)?;
-        let name_buf = self
-            .dma
-            .read_u64(KERNEL_PID, name_addr + UNICODE_STRING_BUFFER)?;
-
-        if name_len == 0 || name_buf == 0 || name_buf < 0xFFFF000000000000 {
-            return Ok(None);
+        if let Some(guid) = self.read_direct_symbolic_link(entry_addr)? {
+            return Ok(Some(guid));
         }
 
-        let name_bytes = self.dma.read(KERNEL_PID, name_buf, name_len as usize)?;
-        let full_path = String::from_utf16_lossy(
-            &name_bytes
-                .chunks(2)
-                .map(|c| u16::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0)]))
-                .collect::<Vec<_>>(),
-        );
-
-        if !full_path.starts_with(VOLUME_GUID_PREFIX) {
-            return Ok(None);
-        }
-
-        let guid_start = VOLUME_GUID_START_OFFSET;
-        let guid_end = guid_start + VOLUME_GUID_CHAR_COUNT;
-
-        if full_path.len() >= guid_end {
-            let guid = full_path[guid_start..guid_end].to_string();
-            return Ok(Some(VolumeGuid::new(
-                entry_addr,
-                name_buf,
-                guid,
-                full_path,
-                is_active != 0,
-            )));
-        }
-
-        Ok(None)
+        self.read_backlinked_symbolic_link(entry_addr)
     }
 
     fn read_unicode_string(&self, addr: u64) -> Result<String> {
@@ -364,4 +345,101 @@ impl<'a> VolumeSpoofer<'a> {
             .map(|d| d.volume_guids.len())
             .sum()
     }
+}
+
+fn is_kernel_pointer(address: u64) -> bool {
+    address >= MIN_KERNEL_POINTER
+}
+
+fn read_symbolic_link_name(
+    dma: &Dma<'_>,
+    entry_addr: u64,
+    name_offset: u64,
+) -> Result<Option<(u64, String)>> {
+    let name_len = dma.read_u16(KERNEL_PID, entry_addr + name_offset + UNICODE_STRING_LENGTH)?;
+    let name_buf = dma.read_u64(KERNEL_PID, entry_addr + name_offset + UNICODE_STRING_BUFFER)?;
+
+    if name_len == 0 || name_buf == 0 || !is_kernel_pointer(name_buf) {
+        return Ok(None);
+    }
+
+    let name_bytes = dma.read(KERNEL_PID, name_buf, name_len as usize)?;
+    let full_path = String::from_utf16_lossy(
+        &name_bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0)]))
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(Some((name_buf, full_path)))
+}
+
+impl<'a> VolumeSpoofer<'a> {
+    fn read_direct_symbolic_link(&self, entry_addr: u64) -> Result<Option<VolumeGuid>> {
+        let Some((name_buf, full_path)) = read_symbolic_link_name(self.dma, entry_addr, 0x10)?
+        else {
+            return Ok(None);
+        };
+
+        let Some(guid) = extract_volume_guid(&full_path) else {
+            return Ok(None);
+        };
+
+        let is_active = self.dma.read_u8(KERNEL_PID, entry_addr + 0x20).unwrap_or(1) != 0;
+        Ok(Some(VolumeGuid::new(
+            entry_addr, name_buf, guid, full_path, is_active,
+        )))
+    }
+
+    fn read_backlinked_symbolic_link(&self, entry_addr: u64) -> Result<Option<VolumeGuid>> {
+        let device_ptr = self
+            .dma
+            .read_u64(KERNEL_PID, entry_addr + self.resolved.layout.symbolic_link_device)?;
+        if !is_kernel_pointer(device_ptr) {
+            return Ok(None);
+        }
+
+        let Some((name_buf, full_path)) = read_symbolic_link_name(
+            self.dma,
+            entry_addr,
+            self.resolved.layout.symbolic_link_name,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let Some(guid) = extract_volume_guid(&full_path) else {
+            return Ok(None);
+        };
+
+        Ok(Some(VolumeGuid::new(
+            entry_addr, name_buf, guid, full_path, true,
+        )))
+    }
+}
+
+fn extract_volume_guid(path: &str) -> Option<String> {
+    let volume_prefix = path.find(VOLUME_GUID_PREFIX)?;
+    let guid_start = volume_prefix + VOLUME_GUID_START_OFFSET;
+    let guid_end = guid_start + VOLUME_GUID_CHAR_COUNT;
+
+    if path.len() < guid_end {
+        return None;
+    }
+
+    let guid = &path[guid_start..guid_end];
+    if !guid
+        .chars()
+        .enumerate()
+        .all(|(index, ch)| matches_guid_char(index, ch))
+    {
+        return None;
+    }
+
+    Some(guid.to_lowercase())
+}
+
+fn matches_guid_char(index: usize, ch: char) -> bool {
+    matches!(index, 8 | 13 | 18 | 23) && ch == '-'
+        || !matches!(index, 8 | 13 | 18 | 23) && ch.is_ascii_hexdigit()
 }

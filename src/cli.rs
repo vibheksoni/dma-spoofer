@@ -230,12 +230,14 @@ fn spoof_module(dma: &Dma, module: &str) -> Result<()> {
                     use crate::hwid::SerialGenerator;
                     use std::path::Path;
                     let config = crate::hwid::SeedConfig::load(Path::new("hwid_seed.json"))
-                        .unwrap_or_else(|| crate::hwid::SeedConfig::new(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_nanos() as u64
-                        ));
+                        .unwrap_or_else(|| {
+                            crate::hwid::SeedConfig::new(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_nanos() as u64,
+                            )
+                        });
                     let mut gen = SerialGenerator::from_config(config);
                     let uuid_str = gen.generate_uuid();
                     let uuid_bytes: [u8; 16] = parse_uuid_to_bytes(&uuid_str);
@@ -332,7 +334,11 @@ fn spoof_module(dma: &Dma, module: &str) -> Result<()> {
 }
 
 fn parse_uuid_to_bytes(s: &str) -> [u8; 16] {
-    let hex: String = s.replace('-', "").chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let hex: String = s
+        .replace('-', "")
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
     let mut bytes = [0u8; 16];
     for i in 0..16.min(hex.len() / 2) {
         bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
@@ -376,9 +382,11 @@ fn test_all_modules(dma: &Dma) -> Result<()> {
         }
     }
 
-    println!("\n[{}] {} working, {} failed",
+    println!(
+        "\n[{}] {} working, {} failed",
         if failed == 0 { "+" } else { "!" },
-        working, failed
+        working,
+        failed
     );
 
     Ok(())
@@ -512,7 +520,10 @@ fn health_check(dma: &Dma) -> Result<()> {
         }
     } else if let Some(info) = dma.get_fpga_info() {
         println!("FPGA ID: {}", info.id);
-        println!("FPGA Version: {}.{}", info.version_major, info.version_minor);
+        println!(
+            "FPGA Version: {}.{}",
+            info.version_major, info.version_minor
+        );
     }
 
     println!("\nConnection Status: {:?}", dma.health_check());
@@ -539,7 +550,10 @@ fn list_gpu(dma: &Dma) -> Result<()> {
             println!("    No UUID candidates");
         } else {
             for candidate in &candidates {
-                println!("    [0x{:04X}] {} {:?}", candidate.offset, candidate.uuid, candidate.confidence);
+                println!(
+                    "    [0x{:04X}] {} {:?}",
+                    candidate.offset, candidate.uuid, candidate.confidence
+                );
             }
         }
     }

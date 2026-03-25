@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use crate::core::Dma;
 use crate::hwid::{SeedConfig, SerialGenerator};
 
-use super::offsets;
+use super::resolver::{resolve_smbios_offsets, ResolvedSmbiosOffsets};
 use super::tables::{
     SmbiosHeader, SmbiosTable, TYPE_BASEBOARD, TYPE_BIOS, TYPE_CHASSIS, TYPE_END, TYPE_MEMORY,
     TYPE_PROCESSOR, TYPE_SYSTEM,
@@ -15,6 +15,7 @@ use super::tables::{
 pub struct SmbiosSpoofer<'a> {
     dma: &'a Dma<'a>,
     ntoskrnl_base: u64,
+    offsets: ResolvedSmbiosOffsets,
 }
 
 #[derive(Debug, Clone)]
@@ -29,20 +30,29 @@ impl<'a> SmbiosSpoofer<'a> {
         let module = dma
             .get_module(4, "ntoskrnl.exe")
             .context("Failed to find ntoskrnl.exe")?;
+        let offsets = resolve_smbios_offsets(dma, module.base, module.size)?;
 
         println!(
             "[+] Found ntoskrnl.exe @ 0x{:X} (size: 0x{:X})",
             module.base, module.size
         );
+        if offsets.build_number > 0 {
+            println!("[+] SMBIOS offset profile build: {}", offsets.build_number);
+        }
+        println!(
+            "[+] SMBIOS table globals: physical=ntoskrnl.exe+0x{:X}, length=ntoskrnl.exe+0x{:X}",
+            offsets.table_physical_address, offsets.table_length
+        );
 
         Ok(Self {
             dma,
             ntoskrnl_base: module.base,
+            offsets,
         })
     }
 
     fn get_table_physical_address(&self) -> Result<u64> {
-        let addr = self.ntoskrnl_base + offsets::SMBIOS_TABLE_PHYSICAL_ADDRESS;
+        let addr = self.ntoskrnl_base + self.offsets.table_physical_address;
         let phys = self.dma.read_u64(4, addr)?;
         if phys == 0 {
             bail!("SMBIOS physical address is NULL");
@@ -51,7 +61,7 @@ impl<'a> SmbiosSpoofer<'a> {
     }
 
     fn get_table_length(&self) -> Result<u32> {
-        let addr = self.ntoskrnl_base + offsets::SMBIOS_TABLE_LENGTH;
+        let addr = self.ntoskrnl_base + self.offsets.table_length;
         self.dma.read_u32(4, addr)
     }
 

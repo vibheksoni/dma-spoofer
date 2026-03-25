@@ -1,3 +1,4 @@
+mod cli;
 mod core;
 mod hwid;
 mod spoofers;
@@ -7,6 +8,7 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 
+use crate::cli::{CliArgs, CliCommand, run_cli, parse_args};
 use crate::core::{DeviceType, Dma, DsePatcher, PatchGuardBypass, VmwareInfo};
 use crate::hwid::{SeedConfig, SerialGenerator};
 use crate::spoofers::arp::ArpSpoofer;
@@ -36,6 +38,13 @@ fn clear_screen() {
 
 fn main() -> Result<()> {
     enable_ansi_support();
+
+    let args = parse_args();
+
+    if args.command != CliCommand::Gui {
+        return run_cli(&args);
+    }
+
     clear_screen();
     print_banner();
 

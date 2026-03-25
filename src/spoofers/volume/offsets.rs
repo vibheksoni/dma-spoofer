@@ -33,9 +33,8 @@ pub const DEVICE_OBJECT_DEVICE_EXTENSION: u64 = 0x40;
 pub const WIN10_2004_BUILD: u32 = 19041;
 pub const WIN11_21H2_BUILD: u32 = 22000;
 
-pub const WIN10_LAYOUT: VolumeLayout =
-    VolumeLayout::new(0x10, 0x10, 0x50, Some(0x60), 0x10, 0x18);
-pub const WIN11_LAYOUT: VolumeLayout = VolumeLayout::new(0x10, 0x10, 0x40, Some(0x60), 0x10, 0x18);
+pub const WIN10_LAYOUT: VolumeLayout = VolumeLayout::new(0x10, 0x10, 0x50, Some(0x60), 0x10, 0x18);
+pub const WIN11_LAYOUT: VolumeLayout = VolumeLayout::new(0x10, 0x10, 0x50, Some(0x60), 0x10, 0x18);
 
 pub fn layout_for_build(build_number: u32) -> VolumeLayout {
     match build_number {

@@ -376,8 +376,12 @@ fn read_symbolic_link_name(
 
 impl<'a> VolumeSpoofer<'a> {
     fn read_direct_symbolic_link(&self, entry_addr: u64) -> Result<Option<VolumeGuid>> {
-        let Some((name_buf, full_path)) = read_symbolic_link_name(self.dma, entry_addr, 0x10)?
-        else {
+        let direct_name = read_symbolic_link_name(self.dma, entry_addr, 0x18)?.or_else(|| {
+            read_symbolic_link_name(self.dma, entry_addr, 0x10)
+                .ok()
+                .flatten()
+        });
+        let Some((name_buf, full_path)) = direct_name else {
             return Ok(None);
         };
 
@@ -392,9 +396,10 @@ impl<'a> VolumeSpoofer<'a> {
     }
 
     fn read_backlinked_symbolic_link(&self, entry_addr: u64) -> Result<Option<VolumeGuid>> {
-        let device_ptr = self
-            .dma
-            .read_u64(KERNEL_PID, entry_addr + self.resolved.layout.symbolic_link_device)?;
+        let device_ptr = self.dma.read_u64(
+            KERNEL_PID,
+            entry_addr + self.resolved.layout.symbolic_link_device,
+        )?;
         if !is_kernel_pointer(device_ptr) {
             return Ok(None);
         }

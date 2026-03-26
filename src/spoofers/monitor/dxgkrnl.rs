@@ -6,12 +6,52 @@ use crate::core::Dma;
 
 const KERNEL_PID: u32 = 4;
 
-const EDIDCACHE_POINTER_OFFSET: u64 = 0x15f4d8;
-const EDIDCACHE_ENTRY_SIZE: u64 = 152;
-const EDIDCACHE_MAX_ENTRIES: usize = 4;
-const EDIDCACHE_ENTRY_START: u64 = 0x10;
-const EDID_OFFSET_IN_ENTRY: u64 = 0x20;
+const WIN10_2004_BUILD: u32 = 19041;
+const WIN11_21H2_BUILD: u32 = 22000;
 const EDID_SIZE: usize = 128;
+
+#[derive(Debug, Clone, Copy)]
+struct DxgkrnlEdidLayout {
+    dxgglobal_slot_rva: Option<u64>,
+    dxgglobal_edid_cache_offset: u64,
+    direct_edid_cache_ptr_rva: Option<u64>,
+    entry_start_offset: u64,
+    entry_size: u64,
+    max_entries: usize,
+    luid_low_offset: u64,
+    luid_high_offset: u64,
+    target_id_offset: u64,
+    capabilities_origin_offset: u64,
+    edid_offset: u64,
+}
+
+const WIN10_LAYOUT: DxgkrnlEdidLayout = DxgkrnlEdidLayout {
+    dxgglobal_slot_rva: Some(0x0B4198),
+    dxgglobal_edid_cache_offset: 0x3F0,
+    direct_edid_cache_ptr_rva: None,
+    entry_start_offset: 0x00,
+    entry_size: 0x98,
+    max_entries: 4,
+    luid_low_offset: 0x08,
+    luid_high_offset: 0x0C,
+    target_id_offset: 0x10,
+    capabilities_origin_offset: 0x14,
+    edid_offset: 0x18,
+};
+
+const LEGACY_LAYOUT: DxgkrnlEdidLayout = DxgkrnlEdidLayout {
+    dxgglobal_slot_rva: None,
+    dxgglobal_edid_cache_offset: 0,
+    direct_edid_cache_ptr_rva: Some(0x15F4D8),
+    entry_start_offset: 0x10,
+    entry_size: 152,
+    max_entries: 4,
+    luid_low_offset: 0x00,
+    luid_high_offset: 0x04,
+    target_id_offset: 0x08,
+    capabilities_origin_offset: 0x0C,
+    edid_offset: 0x10,
+};
 
 #[derive(Debug, Clone)]
 pub struct CachedEdid {
@@ -29,7 +69,7 @@ pub struct CachedEdid {
 pub struct DxgkrnlEdidSpoofer<'a> {
     dma: &'a Dma<'a>,
     rng: StdRng,
-    dxgkrnl_base: u64,
+    layout: DxgkrnlEdidLayout,
     edid_cache_ptr: u64,
 }
 
@@ -38,19 +78,24 @@ impl<'a> DxgkrnlEdidSpoofer<'a> {
         let dxgkrnl_base = Self::find_dxgkrnl_base(dma)?;
         println!("[*] dxgkrnl.sys base: 0x{:X}", dxgkrnl_base);
 
-        let edid_cache_ptr_addr = dxgkrnl_base + EDIDCACHE_POINTER_OFFSET;
-        let edid_cache_ptr = dma.read_u64(KERNEL_PID, edid_cache_ptr_addr)?;
+        let build_number = Self::detect_build_number(dma).unwrap_or(0);
+        let layout = Self::layout_for_build(build_number);
+        if build_number > 0 {
+            println!("[*] dxgkrnl EDID layout build: {}", build_number);
+        }
+
+        let edid_cache_ptr = Self::resolve_edid_cache_ptr(dma, dxgkrnl_base, layout)?;
 
         if edid_cache_ptr == 0 {
             bail!("EDIDCACHE pointer is null - no monitors connected or cache not initialized");
         }
 
-        println!("[*] s_pEdidCache: 0x{:X}", edid_cache_ptr);
+        println!("[*] EDIDCACHE: 0x{:X}", edid_cache_ptr);
 
         Ok(Self {
             dma,
             rng: StdRng::seed_from_u64(seed),
-            dxgkrnl_base,
+            layout,
             edid_cache_ptr,
         })
     }
@@ -58,6 +103,54 @@ impl<'a> DxgkrnlEdidSpoofer<'a> {
     fn find_dxgkrnl_base(dma: &Dma) -> Result<u64> {
         let module_info = dma.get_module(4, "dxgkrnl.sys")?;
         Ok(module_info.base)
+    }
+
+    fn detect_build_number(dma: &Dma) -> Result<u32> {
+        if let Ok(build_number) = dma
+            .vmm()
+            .get_config(memprocfs::CONFIG_OPT_WIN_VERSION_BUILD)
+        {
+            if build_number > 0 {
+                return Ok(build_number as u32);
+            }
+        }
+
+        let build_number = dma.read_u32(4, 0xFFFFF78000000260)?;
+        Ok(build_number & 0xFFFF)
+    }
+
+    fn layout_for_build(build_number: u32) -> DxgkrnlEdidLayout {
+        match build_number {
+            WIN10_2004_BUILD..WIN11_21H2_BUILD => WIN10_LAYOUT,
+            _ => LEGACY_LAYOUT,
+        }
+    }
+
+    fn resolve_edid_cache_ptr(
+        dma: &Dma,
+        dxgkrnl_base: u64,
+        layout: DxgkrnlEdidLayout,
+    ) -> Result<u64> {
+        if let Some(dxgglobal_slot_rva) = layout.dxgglobal_slot_rva {
+            let dxgglobal_slot = dxgkrnl_base + dxgglobal_slot_rva;
+            let dxgglobal = dma.read_u64(KERNEL_PID, dxgglobal_slot)?;
+            if dxgglobal == 0 {
+                bail!("DXGGLOBAL pointer is null");
+            }
+
+            println!("[*] DXGGLOBAL: 0x{:X}", dxgglobal);
+
+            let edid_cache_ptr =
+                dma.read_u64(KERNEL_PID, dxgglobal + layout.dxgglobal_edid_cache_offset)?;
+            return Ok(edid_cache_ptr);
+        }
+
+        if let Some(edid_cache_ptr_rva) = layout.direct_edid_cache_ptr_rva {
+            let edid_cache_ptr_addr = dxgkrnl_base + edid_cache_ptr_rva;
+            return dma.read_u64(KERNEL_PID, edid_cache_ptr_addr);
+        }
+
+        bail!("No EDIDCACHE resolver available for this build")
     }
 
     pub fn list(&self) -> Result<()> {
@@ -95,20 +188,30 @@ impl<'a> DxgkrnlEdidSpoofer<'a> {
     fn enumerate_cached_edids(&self) -> Result<Vec<CachedEdid>> {
         let mut cached = Vec::new();
 
-        for slot in 0..EDIDCACHE_MAX_ENTRIES {
-            let entry_base =
-                self.edid_cache_ptr + EDIDCACHE_ENTRY_START + (slot as u64 * EDIDCACHE_ENTRY_SIZE);
+        for slot in 0..self.layout.max_entries {
+            let entry_base = self.edid_cache_ptr
+                + self.layout.entry_start_offset
+                + (slot as u64 * self.layout.entry_size);
 
-            let luid_low = self.dma.read_u32(KERNEL_PID, entry_base)?;
-            let luid_high = self.dma.read_u32(KERNEL_PID, entry_base + 4)?;
-            let target_id = self.dma.read_u32(KERNEL_PID, entry_base + 8)?;
-            let capabilities_origin = self.dma.read_u32(KERNEL_PID, entry_base + 12)?;
+            let luid_low = self
+                .dma
+                .read_u32(KERNEL_PID, entry_base + self.layout.luid_low_offset)?;
+            let luid_high = self
+                .dma
+                .read_u32(KERNEL_PID, entry_base + self.layout.luid_high_offset)?;
+            let target_id = self
+                .dma
+                .read_u32(KERNEL_PID, entry_base + self.layout.target_id_offset)?;
+            let capabilities_origin = self.dma.read_u32(
+                KERNEL_PID,
+                entry_base + self.layout.capabilities_origin_offset,
+            )?;
 
             if luid_low == 0 && luid_high == 0 {
                 continue;
             }
 
-            let edid_addr = entry_base + 0x10;
+            let edid_addr = entry_base + self.layout.edid_offset;
             let edid_data = self.dma.read(KERNEL_PID, edid_addr, EDID_SIZE)?;
 
             if !self.is_valid_edid_header(&edid_data) {
@@ -194,9 +297,9 @@ impl<'a> DxgkrnlEdidSpoofer<'a> {
         self.update_checksum(&mut spoofed_edid);
 
         let entry_base = self.edid_cache_ptr
-            + EDIDCACHE_ENTRY_START
-            + (edid_info.slot as u64 * EDIDCACHE_ENTRY_SIZE);
-        let edid_addr = entry_base + 0x10;
+            + self.layout.entry_start_offset
+            + (edid_info.slot as u64 * self.layout.entry_size);
+        let edid_addr = entry_base + self.layout.edid_offset;
 
         self.dma.write(KERNEL_PID, edid_addr, &spoofed_edid)?;
 

@@ -39,6 +39,20 @@ const WIN10_LAYOUT: DxgkrnlEdidLayout = DxgkrnlEdidLayout {
     edid_offset: 0x18,
 };
 
+const WIN11_LAYOUT: DxgkrnlEdidLayout = DxgkrnlEdidLayout {
+    dxgglobal_slot_rva: None,
+    dxgglobal_edid_cache_offset: 0,
+    direct_edid_cache_ptr_rva: Some(0x15F4D8),
+    entry_start_offset: 0x08,
+    entry_size: 152,
+    max_entries: 4,
+    luid_low_offset: 0x08,
+    luid_high_offset: 0x0C,
+    target_id_offset: 0x10,
+    capabilities_origin_offset: 0x14,
+    edid_offset: 0x18,
+};
+
 const LEGACY_LAYOUT: DxgkrnlEdidLayout = DxgkrnlEdidLayout {
     dxgglobal_slot_rva: None,
     dxgglobal_edid_cache_offset: 0,
@@ -122,6 +136,7 @@ impl<'a> DxgkrnlEdidSpoofer<'a> {
     fn layout_for_build(build_number: u32) -> DxgkrnlEdidLayout {
         match build_number {
             WIN10_2004_BUILD..WIN11_21H2_BUILD => WIN10_LAYOUT,
+            WIN11_21H2_BUILD..=u32::MAX => WIN11_LAYOUT,
             _ => LEGACY_LAYOUT,
         }
     }
